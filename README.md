@@ -42,14 +42,29 @@ already under any cap.
 
 ## Per-provider limits
 
-| `PI_PROVIDER` (substring) | keep | why |
+Limit resolution order (per LLM call):
+
+1. **`PI_IMAGE_PRUNE_LIMIT`** — explicit operator pin, always wins
+   (`0` disables pruning).
+2. **Live current model's provider** (`ctx.model.provider`), matched
+   against the `PROVIDER_LIMITS` map by substring. No env needed;
+   follows `/model` switches and mid-session model changes.
+3. **Legacy `PI_PROVIDER` env** — fallback only, for processes where
+   `ctx.model` is undefined.
+4. **Default 12** — ds4-server 16-cap minus headroom.
+
+| provider (substring) | keep | why |
 |---|---|---|
 | `vh114` | 3 | vLLM box launched with `--limit-mm-per-prompt {"image":4}` |
 | *(none / other)* | 12 | default: ds4-server 16-cap minus headroom |
 
-`PI_PROVIDER` is read per-process. If you switch provider mid-session the
-stale value errs safe (over-prunes, never under). Set
-`PI_IMAGE_PRUNE_LIMIT` explicitly to pin.
+Why live resolution: a stale per-process `PI_PROVIDER` pin outlived a
+server switch (2026-09-28 incident — pin said ds4/16, session was on
+vh114/4, and every call after a compaction 400'd with `At most 4
+image(s)`).
+
+Add new servers to the `PROVIDER_LIMITS` map in the file:
+`keep = server cap - 1` headroom.
 
 ## Install
 
@@ -60,21 +75,33 @@ changes in a running session.
 ## Tuning
 
 ```
-PI_IMAGE_PRUNE_LIMIT=8   lower the keep-window (env always wins)
+PI_IMAGE_PRUNE_LIMIT=8   lower the keep-window (pin always wins, logged via=pin)
 PI_IMAGE_PRUNE_LIMIT=0   disable pruning
 ```
-
-Add new servers to the `PROVIDER_LIMITS` map in the file:
-`keep = server cap - 1` headroom.
 
 ## Audit
 
 One line per prune event: `~/.pi/agent/logs/image-pruner.log`
 
 ```
-2026-09-26T20:33:35.284Z pruned 2 (had 14, kept 12); sources: read /tmp/wh_e.png; read /tmp/wh_wide.png
+2026-09-28T18:49:00.613Z pruned 7 (had 10, kept 3) via=live provider=vh114; sources: read /tmp/x/p0.png; read /tmp/x/p1.png
 ```
+
+`via` is the resolution path: `pin` (env), `live` (current model's
+provider), `legacy-env` (fallback `PI_PROVIDER`), or `default`.
 
 ## Revert
 
 Delete the file (or `/reload` after deleting).
+
+## Changelog
+
+- **1.1.0** (2026-09-28): per-provider limit resolved LIVE from the
+  current model's provider (no `PI_PROVIDER` env needed); env pin and
+  legacy env kept; audit lines carry `via=` + `provider=`. Driven by the
+  2026-09-28 vh114 incident (stale `PI_PROVIDER=ds4` pin on a vLLM
+  4-image-cap server → verbatim `At most 4 image(s)` 400s after
+  compaction; reproduced live).
+- **1.0.0** (2026-09-12): initial — per-provider pruning with
+  `PI_PROVIDER`-driven limits, oldest-first placeholder swap, fail-open,
+  audit log.

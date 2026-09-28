@@ -26,7 +26,10 @@
  * impact (removes base64), no provider changes.
  *
  * Tuning:  PI_IMAGE_PRUNE_LIMIT=8   (lower the keep-window; 0 disables)
- *          unset + PI_PROVIDER=vh114 -> 3 (vLLM 4-image cap, per-provider map)
+ *          Per-provider map is resolved LIVE from the current model
+ *          (ctx.model.provider) — no env needed; the legacy PI_PROVIDER env
+ *          still works as a fallback for processes where ctx.model is
+ *          undefined. Explicit PI_IMAGE_PRUNE_LIMIT always wins (operator pin).
  * Revert:  delete this file (or /reload after deleting).
  * Audit:   ~/.pi/agent/logs/image-pruner.log  (one line per prune event)
  */
@@ -38,24 +41,36 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 const DEFAULT_LIMIT = 12; // ds4 hard cap is 16; keep 4 of headroom.
 
 // Per-provider hard caps (keep = cap - 1 headroom). Checked when no explicit
-// PI_IMAGE_PRUNE_LIMIT is set. PI_PROVIDER is per-process: if the user switches
-// provider mid-session the stale value errs safe (over-prunes) at worst; set
-// PI_IMAGE_PRUNE_LIMIT explicitly to pin.
+// PI_IMAGE_PRUNE_LIMIT is set, against the LIVE current model's provider
+// (no per-process env staleness). Legacy PI_PROVIDER env is a fallback only.
 const PROVIDER_LIMITS: Record<string, number> = {
 	vh114: 3, // vLLM box launched with --limit-mm-per-prompt {"image":4} (see run script)
 };
 
-function pruneLimit(): number {
+function matchLimit(prov: string | undefined): number | undefined {
+	if (typeof prov !== "string") return undefined;
+	const p = prov.toLowerCase();
+	for (const [k, v] of Object.entries(PROVIDER_LIMITS)) {
+		if (p.includes(k)) return v;
+	}
+	return undefined;
+}
+
+function resolveLimit(liveProvider?: string): { limit: number; via: string } {
+	// 1) Explicit operator pin always wins.
 	const raw = process.env.PI_IMAGE_PRUNE_LIMIT;
 	if (raw !== undefined) {
 		const n = Number.parseInt(raw, 10);
-		if (Number.isFinite(n)) return n;
+		if (Number.isFinite(n)) return { limit: n, via: "pin" };
 	}
-	const prov = (process.env.PI_PROVIDER ?? "").toLowerCase();
-	for (const [k, v] of Object.entries(PROVIDER_LIMITS)) {
-		if (prov.includes(k)) return v;
-	}
-	return DEFAULT_LIMIT;
+	// 2) Live current model's provider (no env staleness, survives /model
+	//    switches and mid-session model changes).
+	const live = matchLimit(liveProvider);
+	if (live !== undefined) return { limit: live, via: "live" };
+	// 3) Legacy per-process env fallback (covers ctx.model === undefined).
+	const legacy = matchLimit(process.env.PI_PROVIDER);
+	if (legacy !== undefined) return { limit: legacy, via: "legacy-env" };
+	return { limit: DEFAULT_LIMIT, via: "default" };
 }
 
 interface ContentBlock {
@@ -115,9 +130,10 @@ function appendAudit(line: string): void {
 }
 
 export default function imagePruner(pi: ExtensionAPI) {
-	pi.on("context", async (event) => {
+	pi.on("context", async (event, ctx) => {
 		try {
-			const limit = pruneLimit();
+			const liveProvider = (ctx as { model?: { provider?: string } } | undefined)?.model?.provider;
+			const { limit, via } = resolveLimit(liveProvider);
 			if (limit <= 0) return; // disabled
 
 			const messages = event.messages as AnyMessage[];
@@ -200,7 +216,7 @@ export default function imagePruner(pi: ExtensionAPI) {
 			}
 
 			appendAudit(
-				`${new Date().toISOString()} pruned ${toPrune} (had ${images.length}, kept ${limit}); ` +
+				`${new Date().toISOString()} pruned ${toPrune} (had ${images.length}, kept ${limit}) via=${via} provider=${liveProvider ?? "?"}; ` +
 					`sources: ${pruned.map((p) => p.label).slice(0, 8).join("; ")}`,
 			);
 			// Mutations were made on the (deep-copied) messages in-place AND returned
